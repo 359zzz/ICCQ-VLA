@@ -23,7 +23,7 @@
 先准备这些变量：
 
 ```bash
-DATASET_ROOT=/path/to/lerobot_datasets
+DATASET_ROOT=/path/to/lerobot_dataset_directory
 DATASET_REPO=your_name/iccq_single_arm_round1
 TASK_DESC="pick up and put the bottle into the box"
 
@@ -50,6 +50,9 @@ QBC_OUT=outputs/train/pi05_qbc_single_arm
 
 说明：
 
+- `DATASET_ROOT` 在当前这些脚本里指的是“最终数据集目录本身”，不是父目录。
+  例如可以直接写成 `/app/下载/lerobot_datasets/ICCQ/ICCQ_Value_loop_20260317`。
+- 当 `--resume=false` 时，这个目录必须还不存在；如果目录已经存在，要么删掉重录，要么改新目录名，要么确认是有效旧数据集后加 `--resume=true`。
 - `BASE_POLICY_SERVER_PATH` 可以直接用你已经做好的 LoRA / finetune checkpoint。
 - 不需要为了人在环路采集重新训练一版 LoRA。
 - 只要服务器上的 `policy_server` 能 `from_pretrained(...)` 正常加载它，就能直接拿来做 HIL 数据采集。
@@ -140,16 +143,16 @@ CUDA_VISIBLE_DEVICES=7 python -m lerobot.async_inference.policy_server \
 ```bash
 lerobot-async-human-inloop-record \
   --robot.type=piper_follower \
-  --robot.port=${FOLLOWER_CAN_PORT} \
-  --robot.id=${FOLLOWER_ID} \
+  --robot.port=can2 \
+  --robot.id=my_piper_follower \
   --robot.speed_ratio=35 \
   --robot.high_follow=false \
   --robot.startup_sleep_s=0.5 \
   --robot.require_calibration=false \
-  --robot.cameras="{ wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM_SERIAL}\", width: 640, height: 480, fps: 30, warmup_s: 2}, top: {type: intelrealsense, serial_number_or_name: \"${TOP_CAM_SERIAL}\", width: 640, height: 480, fps: 30, warmup_s: 2} }" \
+  --robot.cameras="{ wrist: {type: intelrealsense, serial_number_or_name: "419622072329", width: 640, height: 480, fps: 30, warmup_s: 2}, top: {type: intelrealsense, serial_number_or_name: "420222071960", width: 640, height: 480, fps: 30, warmup_s: 2} }" \
   --teleop.type=piper_leader \
-  --teleop.port=${LEADER_CAN_PORT} \
-  --teleop.id=${LEADER_ID} \
+  --teleop.port=can1 \
+  --teleop.id=my_piper_leader \
   --teleop.command_speed_ratio=25 \
   --teleop.gravity_comp_control_hz=80 \
   --teleop.gravity_comp_torque_limit=0.8 \
@@ -157,18 +160,18 @@ lerobot-async-human-inloop-record \
   --teleop.fallback_to_feedback=true \
   --teleop.startup_sleep_s=0.5 \
   --teleop.require_calibration=false \
-  --dataset.repo_id=${DATASET_REPO} \
-  --dataset.root=${DATASET_ROOT} \
-  --dataset.single_task="${TASK_DESC}" \
+  --dataset.repo_id=zhang/ICCQ_Value_loop_20260317 \
+  --dataset.root=/app/下载/lerobot_datasets/ICCQ/ICCQ_Value_loop_20260317 \
+  --dataset.single_task="pick up and put the bottle into the box" \
   --dataset.fps=30 \
   --dataset.num_episodes=10 \
   --dataset.episode_time_s=240 \
   --dataset.reset_time_s=30 \
   --dataset.push_to_hub=false \
   --dataset.vcodec=h264 \
-  --async_policy.server_address=${ASYNC_POLICY_SERVER} \
+  --async_policy.server_address=59.72.98.55:8082 \
   --async_policy.policy_type=pi05 \
-  --async_policy.pretrained_name_or_path=${BASE_POLICY_SERVER_PATH} \
+  --async_policy.pretrained_name_or_path=/workspace/outputs/pi05_right_arm_5k/checkpoints/last/pretrained_model \
   --async_policy.policy_device=cuda \
   --async_policy.client_device=cpu \
   --async_policy.actions_per_chunk=36 \
