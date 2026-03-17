@@ -8,26 +8,39 @@
 - intervention preference 挖掘
 - `ICCQ -> q_infer -> QBC post-training`
 
-默认对象是单臂 AgileX PiPER / PiPER-X。
+这份版本默认按你当前的真实配置来写：
 
-如果你用的是非 X 版本，把下面命令里的：
+- 机械臂是 `piper`，不是 `piperx`
+- 右臂 `can2` 是 follower / 执行臂
+- 左臂 `can1` 是 leader / 示教主臂
+- 工控机负责相机、CAN、采集
+- 服务器负责 `policy_server` 远端异步推理
 
-- `piperx_follower` 改成 `piper_follower`
-- `piperx_leader` 改成 `piper_leader`
+如果你以后切回本地单机推理，可以把下面的 `lerobot-async-human-inloop-record` 换回 `lerobot-human-inloop-record`。
 
 ## 0. 前置约定
 
 先准备这些变量：
 
 ```bash
-DATASET_ROOT=/path/to/local_dataset_root
+DATASET_ROOT=/path/to/lerobot_datasets
 DATASET_REPO=your_name/iccq_single_arm_round1
-TASK_DESC="pick up the bottle and place it on the coaster"
+TASK_DESC="pick up and put the bottle into the box"
 
-FOLLOWER_CAN_PORT=can0
+FOLLOWER_CAN_PORT=can2
 LEADER_CAN_PORT=can1
+FOLLOWER_ID=my_piper_follower
+LEADER_ID=my_piper_leader
 
-BASE_POLICY=/path/to/base_policy_or_checkpoint
+WRIST_CAM_SERIAL=419622072329
+TOP_CAM_SERIAL=420222071960
+
+ASYNC_POLICY_SERVER=59.72.98.55:8080
+
+# 必须填服务器端能直接读取的 checkpoint 路径。
+# 强烈建议用固定步数目录，不要用会漂移的 `last/`。
+BASE_POLICY_SERVER_PATH=/workspace/outputs/pi05_right_arm_5k/checkpoints/005000/pretrained_model
+
 Q_TRAIN_OUT=outputs/q_train/iccq_single_arm
 Q_INFER_OUT=outputs/q_infer/iccq_single_arm
 Q_VALUES=${Q_INFER_OUT}/q_values.parquet
@@ -35,21 +48,37 @@ PREFS=outputs/intervention_preferences/iccq_single_arm_prefs.parquet
 QBC_OUT=outputs/train/pi05_qbc_single_arm
 ```
 
-建议第一轮先全部本地落盘，先不要混进多轮 merge。
+说明：
+
+- `BASE_POLICY_SERVER_PATH` 可以直接用你已经做好的 LoRA / finetune checkpoint。
+- 不需要为了人在环路采集重新训练一版 LoRA。
+- 只要服务器上的 `policy_server` 能 `from_pretrained(...)` 正常加载它，就能直接拿来做 HIL 数据采集。
+- `collector_policy_id` 会默认记录这个 checkpoint 路径，所以路径最好一开始就选稳定的、可复现的。
 
 ## 1. 确认单臂遥操作正常
 
-先确认机械臂、leader、CAN 都通。
+你工控机端可以继续复用原来跑通的 Evo-RL 那套机械臂接入方式。
+
+先把 CAN 配好，再做一次遥操作确认。
+
+### 1.1 配置和检查 CAN
+
+```bash
+lerobot-setup-can --mode=setup --interfaces=${LEADER_CAN_PORT},${FOLLOWER_CAN_PORT}
+lerobot-setup-can --mode=test --interfaces=${LEADER_CAN_PORT},${FOLLOWER_CAN_PORT}
+```
+
+### 1.2 检查 leader-follower 跟手
 
 ```bash
 lerobot-teleoperate \
-  --robot.type=piperx_follower \
+  --robot.type=piper_follower \
   --robot.port=${FOLLOWER_CAN_PORT} \
-  --robot.id=my_piperx_follower \
+  --robot.id=${FOLLOWER_ID} \
   --robot.require_calibration=false \
-  --teleop.type=piperx_leader \
+  --teleop.type=piper_leader \
   --teleop.port=${LEADER_CAN_PORT} \
-  --teleop.id=my_piperx_leader \
+  --teleop.id=${LEADER_ID} \
   --teleop.require_calibration=false
 ```
 
@@ -59,31 +88,124 @@ lerobot-teleoperate \
 - gripper 同步正常
 - 没有持续报 CAN / calibration 错误
 
-## 2. 采集人类接管数据
+## 2. 服务器端启动异步推理
 
-如果你要做 ICCQ，建议直接用 `lerobot-human-inloop-record`，不要再用普通 `lerobot-record`。
+你现在的推荐模式不是本地 `--policy.path=...`，而是：
 
-它现在会自动打开：
+- 服务器跑 `policy_server`
+- 工控机跑 `lerobot-async-human-inloop-record`
+
+### 2.1 建议的服务器容器
+
+你之前的 `lerobot_openpi:v4` 镜像可以继续用，推荐新起一个容器，把当前仓库挂进去：
+
+```bash
+docker run --gpus all --network host --shm-size=32g -it \
+  -v /path/to/ICCQ-VLA:/workspace/ICCQ-VLA \
+  -v /path/to/outputs:/workspace/outputs \
+  lerobot_openpi:v4 bash
+```
+
+容器里建议：
+
+```bash
+cd /workspace/ICCQ-VLA
+pip install -e .
+```
+
+### 2.2 启动异步 `policy_server`
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8080 \
+  --fps=30 \
+  --inference_latency=0.08 \
+  --obs_queue_timeout=2.0
+```
+
+这个命令本身就是异步推理服务端。
+
+异步性来自两部分：
+
+- `policy_server` 按 observation 队列异步生成 action chunk
+- 工控机端 `lerobot-async-human-inloop-record` 通过远端 adapter 做 observation 发送、action chunk 接收和本地聚合
+
+所以你之前那条服务器命令是对的，现在差的只是工控机端需要换成新的异步 HIL 入口。
+
+## 3. 工控机端采集 HIL 数据
+
+### 3.1 推荐路径：直接用你现有 LoRA checkpoint 做异步人在环路采集
+
+```bash
+lerobot-async-human-inloop-record \
+  --robot.type=piper_follower \
+  --robot.port=${FOLLOWER_CAN_PORT} \
+  --robot.id=${FOLLOWER_ID} \
+  --robot.speed_ratio=35 \
+  --robot.high_follow=false \
+  --robot.startup_sleep_s=0.5 \
+  --robot.require_calibration=false \
+  --robot.cameras="{ wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM_SERIAL}\", width: 640, height: 480, fps: 30, warmup_s: 2}, top: {type: intelrealsense, serial_number_or_name: \"${TOP_CAM_SERIAL}\", width: 640, height: 480, fps: 30, warmup_s: 2} }" \
+  --teleop.type=piper_leader \
+  --teleop.port=${LEADER_CAN_PORT} \
+  --teleop.id=${LEADER_ID} \
+  --teleop.command_speed_ratio=25 \
+  --teleop.gravity_comp_control_hz=80 \
+  --teleop.gravity_comp_torque_limit=0.8 \
+  --teleop.prefer_ctrl_messages=true \
+  --teleop.fallback_to_feedback=true \
+  --teleop.startup_sleep_s=0.5 \
+  --teleop.require_calibration=false \
+  --dataset.repo_id=${DATASET_REPO} \
+  --dataset.root=${DATASET_ROOT} \
+  --dataset.single_task="${TASK_DESC}" \
+  --dataset.fps=30 \
+  --dataset.num_episodes=10 \
+  --dataset.episode_time_s=240 \
+  --dataset.reset_time_s=30 \
+  --dataset.push_to_hub=false \
+  --dataset.vcodec=h264 \
+  --async_policy.server_address=${ASYNC_POLICY_SERVER} \
+  --async_policy.policy_type=pi05 \
+  --async_policy.pretrained_name_or_path=${BASE_POLICY_SERVER_PATH} \
+  --async_policy.policy_device=cuda \
+  --async_policy.client_device=cpu \
+  --async_policy.actions_per_chunk=36 \
+  --async_policy.chunk_size_threshold=0.6 \
+  --async_policy.fps=8 \
+  --async_policy.aggregate_fn_name=conservative \
+  --acp_inference.enable=true \
+  --acp_inference.use_cfg=false \
+  --play_sounds=false
+```
+
+这个入口现在会自动打开：
 
 - `episode_success` 标注
 - `complementary_info.collector_policy_id`
 - `complementary_info.collector_source`
 - `complementary_info.is_intervention`
-- `complementary_info.policy_action`（有 policy 时）
+- `complementary_info.policy_action`
 
-### 2.1 纯人工首轮数据
+其中字段语义固定为：
 
-如果你还没有一个 base policy，可以先录纯人工数据：
+- `collector_policy_id` 记录当前远端 policy checkpoint 的 provenance
+- `collector_source` 记录这一帧实际是谁执行的，`policy` 或 `human`
+
+### 3.2 如果还没有 policy，可先录纯人工首轮数据
+
+如果某一轮你想先做纯人工冷启动，也可以继续用本地入口：
 
 ```bash
 lerobot-human-inloop-record \
-  --robot.type=piperx_follower \
+  --robot.type=piper_follower \
   --robot.port=${FOLLOWER_CAN_PORT} \
-  --robot.id=my_piperx_follower \
+  --robot.id=${FOLLOWER_ID} \
   --robot.require_calibration=false \
-  --teleop.type=piperx_leader \
+  --teleop.type=piper_leader \
   --teleop.port=${LEADER_CAN_PORT} \
-  --teleop.id=my_piperx_leader \
+  --teleop.id=${LEADER_ID} \
   --teleop.require_calibration=false \
   --dataset.repo_id=${DATASET_REPO} \
   --dataset.root=${DATASET_ROOT} \
@@ -93,31 +215,6 @@ lerobot-human-inloop-record \
   --dataset.reset_time_s=8 \
   --dataset.push_to_hub=false \
   --display_data=true
-```
-
-### 2.2 带 policy 的 HIL 数据
-
-如果你已经有一个 base policy，要录 intervention 数据，就把 `--policy.path` 带上：
-
-```bash
-lerobot-human-inloop-record \
-  --robot.type=piperx_follower \
-  --robot.port=${FOLLOWER_CAN_PORT} \
-  --robot.id=my_piperx_follower \
-  --robot.require_calibration=false \
-  --teleop.type=piperx_leader \
-  --teleop.port=${LEADER_CAN_PORT} \
-  --teleop.id=my_piperx_leader \
-  --teleop.require_calibration=false \
-  --dataset.repo_id=${DATASET_REPO} \
-  --dataset.root=${DATASET_ROOT} \
-  --dataset.single_task="${TASK_DESC}" \
-  --dataset.num_episodes=50 \
-  --dataset.episode_time_s=25 \
-  --dataset.reset_time_s=8 \
-  --dataset.push_to_hub=false \
-  --display_data=true \
-  --policy.path=${BASE_POLICY}
 ```
 
 常用热键：
@@ -132,12 +229,12 @@ lerobot-human-inloop-record \
 - 接管后尽量把它带回正确轨道，再交还 policy 或结束 episode
 - 成功 / 失败一定要按键，不要依赖默认值
 
-## 3. 检查数据是否满足 ICCQ 要求
+## 4. 检查数据是否满足 ICCQ 要求
 
 采完马上做一次 report：
 
 ```bash
-lerobot-dataset-report --dataset ${DATASET_ROOT}
+lerobot-dataset-report --dataset ${DATASET_REPO} --root ${DATASET_ROOT}
 ```
 
 你至少要确认这几项：
@@ -149,7 +246,7 @@ lerobot-dataset-report --dataset ${DATASET_ROOT}
 
 如果这一步不对，后面的 pair mining 和 shadow replay 都不要继续跑。
 
-## 4. 挖 intervention preference
+## 5. 挖 intervention preference
 
 这一步把 human takeover 变成 `(positive chunk, negative chunk)` 偏好对。
 
@@ -188,7 +285,7 @@ lerobot-prepare-intervention-preferences \
 - provenance 不完整
 - policy checkpoint 路径不可恢复
 
-## 5. 训练 ICCQ critic
+## 6. 训练 ICCQ critic
 
 这一步训练 chunk-level critic。
 
@@ -220,7 +317,7 @@ lerobot-q-train \
 
 训练完成后，后面会用 `${Q_TRAIN_OUT}` 里的 checkpoint 做 `q_infer`。
 
-## 6. 跑 critic inference，导出 QBC 权重
+## 7. 跑 critic inference，导出 QBC 权重
 
 这一步把每个 frame 的：
 
@@ -254,15 +351,15 @@ ${Q_INFER_OUT}/q_values.parquet
 
 这就是后面 `lerobot-train --use_qbc=true` 直接吃的文件。
 
-## 7. 用 QBC 做单臂策略后训练
+## 8. 用 QBC 做单臂策略后训练
 
-这里建议先从已有 base policy 继续 finetune，而不是从头训。
+这里建议在服务器端，从已有 base policy 继续 finetune，而不是从头训。
 
 如果你的 backbone 是 `pi05`，一个最小命令可以是：
 
 ```bash
 lerobot-train \
-  --policy.path=${BASE_POLICY} \
+  --policy.path=${BASE_POLICY_SERVER_PATH} \
   --dataset.repo_id=${DATASET_REPO} \
   --dataset.root=${DATASET_ROOT} \
   --batch_size=8 \
@@ -284,19 +381,29 @@ lerobot-train \
 - 如果 `q_values.parquet` 已经带了 `qbc_weight` 列，train 会直接优先用它
 - 如果你只保留了 `advantage` 列，train 也可以按 `qbc_beta / clip_*` 现场重算
 
-## 8. 部署下一轮单臂 HIL
+## 9. 部署下一轮单臂 HIL
 
-拿着 QBC 训练后的 checkpoint，再录下一轮：
+拿着 QBC 训练后的 checkpoint，在工控机端再录下一轮异步 HIL：
 
 ```bash
-lerobot-human-inloop-record \
-  --robot.type=piperx_follower \
+lerobot-async-human-inloop-record \
+  --robot.type=piper_follower \
   --robot.port=${FOLLOWER_CAN_PORT} \
-  --robot.id=my_piperx_follower \
+  --robot.id=${FOLLOWER_ID} \
+  --robot.speed_ratio=35 \
+  --robot.high_follow=false \
+  --robot.startup_sleep_s=0.5 \
   --robot.require_calibration=false \
-  --teleop.type=piperx_leader \
+  --robot.cameras="{ wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM_SERIAL}\", width: 640, height: 480, fps: 30, warmup_s: 2}, top: {type: intelrealsense, serial_number_or_name: \"${TOP_CAM_SERIAL}\", width: 640, height: 480, fps: 30, warmup_s: 2} }" \
+  --teleop.type=piper_leader \
   --teleop.port=${LEADER_CAN_PORT} \
-  --teleop.id=my_piperx_leader \
+  --teleop.id=${LEADER_ID} \
+  --teleop.command_speed_ratio=25 \
+  --teleop.gravity_comp_control_hz=80 \
+  --teleop.gravity_comp_torque_limit=0.8 \
+  --teleop.prefer_ctrl_messages=true \
+  --teleop.fallback_to_feedback=true \
+  --teleop.startup_sleep_s=0.5 \
   --teleop.require_calibration=false \
   --dataset.repo_id=${DATASET_REPO} \
   --dataset.root=${DATASET_ROOT} \
@@ -305,10 +412,24 @@ lerobot-human-inloop-record \
   --dataset.episode_time_s=25 \
   --dataset.reset_time_s=8 \
   --dataset.push_to_hub=false \
-  --display_data=true \
-  --policy.path=${QBC_OUT} \
+  --dataset.vcodec=h264 \
+  --async_policy.server_address=${ASYNC_POLICY_SERVER} \
+  --async_policy.policy_type=pi05 \
+  --async_policy.pretrained_name_or_path=${QBC_OUT}/checkpoints/last/pretrained_model \
+  --async_policy.policy_device=cuda \
+  --async_policy.client_device=cpu \
+  --async_policy.actions_per_chunk=36 \
+  --async_policy.chunk_size_threshold=0.6 \
+  --async_policy.fps=8 \
+  --async_policy.aggregate_fn_name=conservative \
+  --acp_inference.enable=true \
+  --acp_inference.use_cfg=false \
+  --play_sounds=false \
   --resume=true
 ```
+
+正式采集前，最好把 `last/pretrained_model` 再替换成固定步数目录，比如
+`${QBC_OUT}/checkpoints/010000/pretrained_model`，避免后续继续训练后 provenance 漂移。
 
 建议每一轮都重复：
 
@@ -318,20 +439,21 @@ lerobot-human-inloop-record \
 4. `q_infer`
 5. `lerobot-train --use_qbc=true`
 
-## 9. 单臂第一轮推荐顺序
+## 10. 单臂第一轮推荐顺序
 
 如果你现在是第一次完整跑通，建议顺序就是：
 
-1. 准备一个 base policy
-2. 用 `lerobot-human-inloop-record --policy.path=...` 采一轮单臂 HIL 数据
-3. `lerobot-dataset-report --dataset ${DATASET_ROOT}`
-4. `lerobot-prepare-intervention-preferences`
-5. `lerobot-q-train`
-6. `lerobot-q-infer`
-7. `lerobot-train --use_qbc=true`
-8. 再拿 QBC 后的 checkpoint 回到 `lerobot-human-inloop-record`
+1. 在服务器上准备一个可加载的 base policy checkpoint
+2. 启动 `python -m lerobot.async_inference.policy_server`
+3. 在工控机上用 `lerobot-async-human-inloop-record` 采一轮单臂 HIL 数据
+4. `lerobot-dataset-report --dataset ${DATASET_REPO} --root ${DATASET_ROOT}`
+5. `lerobot-prepare-intervention-preferences`
+6. `lerobot-q-train`
+7. `lerobot-q-infer`
+8. `lerobot-train --use_qbc=true`
+9. 再拿 QBC 后的 checkpoint 回到 `lerobot-async-human-inloop-record`
 
-## 10. 当前实现的几个重要约定
+## 11. 当前实现的几个重要约定
 
 为了避免后面混淆，当前代码里这几个字段的语义固定如下：
 
@@ -347,9 +469,10 @@ lerobot-human-inloop-record \
 
 这正是后面 shadow replay 和 preference mining 需要的结构。
 
-## 11. 现阶段最容易踩的坑
+## 12. 现阶段最容易踩的坑
 
 - `collector_policy_id` 不是可恢复 checkpoint 的路径或 ID
+- 服务器端还在用 `last/`，但你又继续训练过，导致 provenance 漂移
 - dataset 里没有 `episode_success`
 - 录的是纯人工数据，却直接去跑 preference mining
 - `q_infer` 用的不是和 `q_train` 同一份数据集

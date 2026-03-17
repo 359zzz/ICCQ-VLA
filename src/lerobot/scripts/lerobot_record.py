@@ -362,7 +362,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    policy = None
+    preprocessor = None
+    postprocessor = None
     policy_sync_executor = None
+    skip_dataset_name_check = bool(getattr(cfg, "_skip_dataset_name_check", False))
+    runtime_policy_builder = getattr(cfg, "_make_runtime_policy", None)
 
     try:
         if cfg.resume:
@@ -381,7 +386,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
             # Create empty dataset or load existing saved episodes
-            sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
+            if not skip_dataset_name_check:
+                sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,
@@ -396,12 +402,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
 
         # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
-        preprocessor = None
-        postprocessor = None
-        if cfg.acp_inference.enable and cfg.policy is None:
+        if cfg.acp_inference.enable and cfg.policy is None and not callable(runtime_policy_builder):
             raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
-        if cfg.policy is not None:
+        if callable(runtime_policy_builder):
+            policy, preprocessor, postprocessor = runtime_policy_builder(robot, dataset)
+        elif cfg.policy is not None:
+            policy = make_policy(cfg.policy, ds_meta=dataset.meta)
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
@@ -545,6 +551,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         if policy_sync_executor is not None:
             policy_sync_executor.shutdown()
+
+        if policy is not None and hasattr(policy, "stop"):
+            policy.stop()
 
         if robot.is_connected:
             robot.disconnect()

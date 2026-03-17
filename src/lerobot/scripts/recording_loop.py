@@ -182,15 +182,23 @@ def record_loop(
         # During reset/teleop-only loops keep leader backdrivable for manual dragging.
         set_teleop_manual_control(True)
 
-    # Reset policy and processor if they are provided
-    if policy is not None and preprocessor is not None and postprocessor is not None:
+    policy_supports_direct_prediction = policy is not None and hasattr(policy, "predict_action_from_raw_observation")
+
+    if policy is not None:
         policy.reset()
-        preprocessor.reset()
-        postprocessor.reset()
+        if preprocessor is not None:
+            preprocessor.reset()
+        if postprocessor is not None:
+            postprocessor.reset()
 
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
-    if policy is not None and acp_inference.enable and acp_inference.use_cfg:
+    if (
+        policy is not None
+        and not policy_supports_direct_prediction
+        and acp_inference.enable
+        and acp_inference.use_cfg
+    ):
         cond_policy_runtime_state = _capture_policy_runtime_state(policy)
         uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
 
@@ -257,14 +265,20 @@ def record_loop(
                 else:
                     intervention_state = INTERVENTION_STATE_RELEASE
                     set_teleop_manual_control(False)
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
+                    if policy is not None:
                         policy.reset()
-                        preprocessor.reset()
-                        postprocessor.reset()
-                        if acp_inference.enable and acp_inference.use_cfg:
+                        if preprocessor is not None:
+                            preprocessor.reset()
+                        if postprocessor is not None:
+                            postprocessor.reset()
+                        if (
+                            not policy_supports_direct_prediction
+                            and acp_inference.enable
+                            and acp_inference.use_cfg
+                        ):
                             cond_policy_runtime_state = _capture_policy_runtime_state(policy)
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
+                    if policy is not None:
                         logging.info("Policy cache reset on release: next policy action is recomputed.")
                     logging.info("Intervention release requested (S2): returning control to policy.")
             else:
@@ -282,25 +296,35 @@ def record_loop(
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
-        if (
-            policy is not None
-            and preprocessor is not None
-            and postprocessor is not None
-            and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)
-        ):
-            policy_action = _predict_policy_action_with_acp_inference(
-                observation_frame=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-                acp_inference=acp_inference,
-                cond_runtime_state=cond_policy_runtime_state,
-                uncond_runtime_state=uncond_policy_runtime_state,
-            )
+        if policy is not None and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+            if policy_supports_direct_prediction:
+                policy_action = run_with_connection_retry(
+                    "policy.predict_action_from_raw_observation",
+                    lambda obs=obs: policy.predict_action_from_raw_observation(
+                        observation=obs,
+                        task=single_task,
+                        robot_type=robot.robot_type,
+                        acp_inference=acp_inference,
+                    ),
+                )
+            else:
+                if preprocessor is None or postprocessor is None:
+                    raise ValueError(
+                        "Policy-driven recording requires preprocessors unless the policy exposes `predict_action_from_raw_observation`."
+                    )
+                policy_action = _predict_policy_action_with_acp_inference(
+                    observation_frame=observation_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=single_task,
+                    robot_type=robot.robot_type,
+                    acp_inference=acp_inference,
+                    cond_runtime_state=cond_policy_runtime_state,
+                    uncond_runtime_state=uncond_policy_runtime_state,
+                )
             act_processed_policy = make_robot_action(policy_action, dataset.features)
 
         if isinstance(teleop, Teleoperator):
