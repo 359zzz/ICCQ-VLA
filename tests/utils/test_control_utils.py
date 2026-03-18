@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.control_utils import _apply_keyboard_hotkey_token, sanity_check_bimanual_piper_pair
 from lerobot.utils.recording_annotations import EPISODE_FAILURE, EPISODE_SUCCESS
 
@@ -108,3 +111,19 @@ def test_apply_keyboard_hotkey_token_rejects_unknown_token():
         "toggle_intervention": False,
         "episode_outcome": None,
     }
+
+
+def test_prepare_observation_for_inference_accepts_hwc_images():
+    obs = {"observation.images.top": np.zeros((480, 640, 3), dtype=np.uint8)}
+
+    prepared = prepare_observation_for_inference(obs, torch.device("cpu"))
+
+    assert tuple(prepared["observation.images.top"].shape) == (1, 3, 480, 640)
+
+
+def test_prepare_observation_for_inference_preserves_chw_images():
+    obs = {"observation.images.top": np.zeros((3, 480, 640), dtype=np.uint8)}
+
+    prepared = prepare_observation_for_inference(obs, torch.device("cpu"))
+
+    assert tuple(prepared["observation.images.top"].shape) == (1, 3, 480, 640)

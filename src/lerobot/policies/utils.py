@@ -128,7 +128,13 @@ def prepare_observation_for_inference(
         observation[name] = torch.from_numpy(observation[name])
         if "image" in name:
             observation[name] = observation[name].type(torch.float32) / 255
-            observation[name] = observation[name].permute(2, 0, 1).contiguous()
+            if observation[name].ndim != 3:
+                raise ValueError(
+                    f"Expected image observation '{name}' to have 3 dimensions, got shape {tuple(observation[name].shape)}."
+                )
+            is_channel_first = observation[name].shape[0] <= 4 and observation[name].shape[-1] > 4
+            if not is_channel_first:
+                observation[name] = observation[name].permute(2, 0, 1).contiguous()
         observation[name] = observation[name].unsqueeze(0)
         observation[name] = observation[name].to(device)
 
