@@ -141,9 +141,13 @@ def _resolve_policy_bundle(
     provenance: str,
     dataset: LeRobotDataset,
     device: str,
+    bundle_cache: dict[str, tuple[Any, Any, Any]] | None = None,
 ) -> tuple[Any, Any, Any]:
     if provenance == "human":
         raise ValueError("Cannot shadow replay provenance 'human'.")
+
+    if bundle_cache is not None and provenance in bundle_cache:
+        return bundle_cache[provenance]
 
     cfg = PreTrainedConfig.from_pretrained(provenance)
     cfg.pretrained_path = Path(provenance) if Path(provenance).exists() else provenance  # type: ignore[assignment]
@@ -157,7 +161,10 @@ def _resolve_policy_bundle(
             "device_processor": {"device": device},
         },
     )
-    return policy, preprocessor, postprocessor
+    bundle = (policy, preprocessor, postprocessor)
+    if bundle_cache is not None:
+        bundle_cache[provenance] = bundle
+    return bundle
 
 
 def _replay_shadow_policy_episode(
@@ -166,11 +173,13 @@ def _replay_shadow_policy_episode(
     episode_positions: list[int],
     provenance: str,
     device: str,
+    bundle_cache: dict[str, tuple[Any, Any, Any]] | None = None,
 ) -> np.ndarray:
     policy, preprocessor, postprocessor = _resolve_policy_bundle(
         provenance=provenance,
         dataset=dataset,
         device=device,
+        bundle_cache=bundle_cache,
     )
     policy.reset()
     runtime_state = _capture_policy_runtime_state(policy)
@@ -209,6 +218,7 @@ def _build_episode_policy_replay(
     collector_policy_ids: np.ndarray,
     collector_sources: np.ndarray,
     device: str,
+    bundle_cache: dict[str, tuple[Any, Any, Any]] | None = None,
 ) -> np.ndarray:
     action_dim = dataset.features[ACTION]["shape"][0]
     replay_actions = np.zeros((len(episode_positions), action_dim), dtype=np.float32)
@@ -230,6 +240,7 @@ def _build_episode_policy_replay(
                 episode_positions=segment_positions,
                 provenance=provenance,
                 device=device,
+                bundle_cache=bundle_cache,
             )
 
         segment_start = segment_end + 1
@@ -258,6 +269,7 @@ def _build_preference_rows(
     raw_frames: Any,
     cfg: PreferencePipelineConfig,
 ) -> pd.DataFrame:
+    bundle_cache: dict[str, tuple[Any, Any, Any]] = {}
     episode_indices = np.asarray(raw_frames["episode_index"], dtype=np.int64)
     frame_indices = np.asarray(raw_frames["frame_index"], dtype=np.int64)
     absolute_indices = np.asarray(raw_frames["index"], dtype=np.int64)
@@ -293,6 +305,7 @@ def _build_preference_rows(
                 collector_policy_ids=collector_policy_ids,
                 collector_sources=collector_sources,
                 device=cfg.runtime.device,
+                bundle_cache=bundle_cache,
             )
         elif logged_policy_actions is not None:
             negative_actions = logged_policy_actions[episode_positions]

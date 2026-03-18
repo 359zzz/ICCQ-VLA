@@ -10,6 +10,7 @@ from lerobot.scripts.lerobot_prepare_intervention_preferences import (
     PreferencePipelineConfig,
     _build_preference_rows,
     _extract_onset_positions,
+    _resolve_policy_bundle,
     _to_action_array,
 )
 from lerobot.utils.constants import ACTION
@@ -58,6 +59,52 @@ def test_to_action_array_accepts_column_like_objects():
     assert arr.shape == (2, 2)
     assert arr.dtype == np.float32
     assert arr.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_resolve_policy_bundle_reuses_cache(monkeypatch):
+    dataset = SimpleNamespace(meta=SimpleNamespace(stats={"dummy": 1}))
+    fake_cfg = SimpleNamespace(pretrained_path=None, device=None)
+    calls = {"make_policy": 0, "make_pre_post_processors": 0}
+
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_prepare_intervention_preferences.PreTrainedConfig.from_pretrained",
+        lambda provenance: fake_cfg,
+    )
+
+    def fake_make_policy(*, cfg, ds_meta):
+        calls["make_policy"] += 1
+        return object()
+
+    def fake_make_pre_post_processors(**kwargs):
+        calls["make_pre_post_processors"] += 1
+        return object(), object()
+
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_prepare_intervention_preferences.make_policy",
+        fake_make_policy,
+    )
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_prepare_intervention_preferences.make_pre_post_processors",
+        fake_make_pre_post_processors,
+    )
+
+    bundle_cache = {}
+    bundle_a = _resolve_policy_bundle(
+        provenance="/tmp/fake_ckpt",
+        dataset=dataset,
+        device="cpu",
+        bundle_cache=bundle_cache,
+    )
+    bundle_b = _resolve_policy_bundle(
+        provenance="/tmp/fake_ckpt",
+        dataset=dataset,
+        device="cpu",
+        bundle_cache=bundle_cache,
+    )
+
+    assert bundle_a == bundle_b
+    assert calls["make_policy"] == 1
+    assert calls["make_pre_post_processors"] == 1
 
 
 def test_build_preference_rows_keeps_strongest_overlap(monkeypatch):
