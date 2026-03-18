@@ -30,9 +30,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pyarrow.dataset as pa_ds
 
-from lerobot.datasets.utils import load_episodes, load_info, load_tasks
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 
@@ -130,10 +130,38 @@ def _format_ascii_histogram(histogram: list[dict[str, float | int]], bar_width: 
     return lines
 
 
+def _load_info(dataset_root: Path) -> dict[str, Any]:
+    with open(dataset_root / "meta" / "info.json", encoding="utf-8") as f:
+        info = json.load(f)
+
+    for feature in info.get("features", {}).values():
+        shape = feature.get("shape")
+        if isinstance(shape, list):
+            feature["shape"] = tuple(shape)
+
+    return info
+
+
+def _load_parquet_dataframe(parquet_path: Path) -> pd.DataFrame:
+    dataset = pa_ds.dataset(parquet_path, format="parquet")
+    return dataset.to_table().to_pandas()
+
+
+def _load_tasks(dataset_root: Path) -> pd.DataFrame:
+    return _load_parquet_dataframe(dataset_root / "meta" / "tasks.parquet")
+
+
+def _load_episodes(dataset_root: Path) -> pd.DataFrame:
+    episodes_df = _load_parquet_dataframe(dataset_root / "meta" / "episodes")
+    stats_columns = [col for col in episodes_df.columns if str(col).startswith("stats/")]
+    if stats_columns:
+        episodes_df = episodes_df.drop(columns=stats_columns)
+    return episodes_df
+
+
 def build_report(dataset_root: Path) -> dict[str, Any]:
-    info = load_info(dataset_root)
-    episodes_ds = load_episodes(dataset_root)
-    episodes_df = episodes_ds.to_pandas()
+    info = _load_info(dataset_root)
+    episodes_df = _load_episodes(dataset_root)
 
     actual_episode_count = int(len(episodes_df))
     episode_success_labels = (
@@ -189,7 +217,7 @@ def build_report(dataset_root: Path) -> dict[str, Any]:
             if v is not None and str(v)
         ]
 
-    tasks_df = load_tasks(dataset_root)
+    tasks_df = _load_tasks(dataset_root)
     unique_tasks: list[str] = []
     seen_tasks: set[str] = set()
     if "tasks" in episodes_df.columns:
