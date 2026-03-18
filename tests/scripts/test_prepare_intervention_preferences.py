@@ -10,6 +10,7 @@ from lerobot.scripts.lerobot_prepare_intervention_preferences import (
     PreferencePipelineConfig,
     _build_preference_rows,
     _extract_onset_positions,
+    _to_action_array,
 )
 from lerobot.utils.constants import ACTION
 
@@ -36,9 +37,27 @@ class _TaskTable:
         self.iloc = _TaskIloc(names)
 
 
+class _ColumnWithToList:
+    def __init__(self, values):
+        self._values = values
+
+    def tolist(self):
+        return self._values
+
+
 def test_extract_onset_positions():
     interventions = np.asarray([0.0, 1.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
     assert _extract_onset_positions(interventions) == [1, 4]
+
+
+def test_to_action_array_accepts_column_like_objects():
+    raw_frames = _FakeFrames({ACTION: _ColumnWithToList([[1.0, 2.0], [3.0, 4.0]])})
+
+    arr = _to_action_array(raw_frames, ACTION)
+
+    assert arr.shape == (2, 2)
+    assert arr.dtype == np.float32
+    assert arr.tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
 def test_build_preference_rows_keeps_strongest_overlap(monkeypatch):

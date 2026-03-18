@@ -239,9 +239,17 @@ def _build_episode_policy_replay(
 
 def _to_action_array(raw_frames: Any, action_field: str) -> np.ndarray:
     values = raw_frames[action_field]
+    if isinstance(values, np.ndarray):
+        return values.astype(np.float32, copy=False)
     if isinstance(values, list):
         return np.asarray(values, dtype=np.float32)
-    return np.asarray(values.to_pylist(), dtype=np.float32)
+    if hasattr(values, "to_pylist"):
+        values = values.to_pylist()
+    elif hasattr(values, "tolist"):
+        values = values.tolist()
+    else:
+        values = list(values)
+    return np.asarray(values, dtype=np.float32)
 
 
 def _build_preference_rows(
