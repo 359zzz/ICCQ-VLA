@@ -226,6 +226,9 @@ lerobot-human-inloop-record \
 - `s`: 标记成功并结束当前 episode
 - `f`: 标记失败并结束当前 episode
 
+如果你是在没有 `DISPLAY` 的 headless 容器里运行，当前仓库也会自动尝试启用终端 stdin 热键 fallback。
+这时只要当前 shell 是交互式 TTY，并且这个终端窗口保持焦点，`i / s / f / esc` 仍然可用。
+
 建议：
 
 - intervention 只在 policy 真要犯错的时候接管

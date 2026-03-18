@@ -18,6 +18,10 @@
 
 
 import logging
+import os
+import sys
+import threading
+import time
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -56,13 +60,172 @@ def is_headless():
     except Exception:
         print(
             "Error trying to import pynput. Switching to headless mode. "
-            "As a result, the video stream from the cameras won't be shown, "
-            "and you won't be able to change the control flow with keyboards. "
+            "As a result, the video stream from the cameras won't be shown. "
+            "A terminal hotkey fallback may still be available if stdin is interactive. "
             "For more info, see traceback below.\n"
         )
         traceback.print_exc()
         print()
         return True
+
+
+def _apply_keyboard_hotkey_token(
+    events: dict[str, Any],
+    token: str,
+    *,
+    intervention_toggle_key: str = "i",
+    episode_success_key: str | None = None,
+    episode_failure_key: str | None = None,
+) -> bool:
+    normalized = token.lower()
+
+    if normalized == "right":
+        print("Right arrow key pressed. Exiting loop...")
+        events["exit_early"] = True
+        return True
+    if normalized == "left":
+        print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+        events["rerecord_episode"] = True
+        events["exit_early"] = True
+        return True
+    if normalized == "esc":
+        print("Escape key pressed. Stopping data recording...")
+        events["stop_recording"] = True
+        events["exit_early"] = True
+        return True
+    if normalized == intervention_toggle_key.lower():
+        print(f"'{intervention_toggle_key}' key pressed. Toggling intervention mode...")
+        events["toggle_intervention"] = True
+        return True
+    if episode_success_key and normalized == episode_success_key.lower():
+        print(f"'{episode_success_key}' key pressed. Marking episode as success and exiting loop...")
+        events["episode_outcome"] = EPISODE_SUCCESS
+        events["exit_early"] = True
+        return True
+    if episode_failure_key and normalized == episode_failure_key.lower():
+        print(f"'{episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
+        events["episode_outcome"] = EPISODE_FAILURE
+        events["exit_early"] = True
+        return True
+
+    return False
+
+
+def _can_use_headless_terminal_hotkeys() -> bool:
+    stdin = sys.stdin
+    if stdin is None or stdin.closed:
+        return False
+    is_tty = getattr(stdin, "isatty", None)
+    if not callable(is_tty) or not is_tty():
+        return False
+    fileno = getattr(stdin, "fileno", None)
+    if not callable(fileno):
+        return False
+    return True
+
+
+class _HeadlessTerminalKeyboardListener:
+    def __init__(
+        self,
+        events: dict[str, Any],
+        *,
+        intervention_toggle_key: str = "i",
+        episode_success_key: str | None = None,
+        episode_failure_key: str | None = None,
+    ):
+        self.events = events
+        self.intervention_toggle_key = intervention_toggle_key
+        self.episode_success_key = episode_success_key
+        self.episode_failure_key = episode_failure_key
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="headless-terminal-hotkeys")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+
+    def _dispatch_token(self, token: str) -> None:
+        _apply_keyboard_hotkey_token(
+            self.events,
+            token,
+            intervention_toggle_key=self.intervention_toggle_key,
+            episode_success_key=self.episode_success_key,
+            episode_failure_key=self.episode_failure_key,
+        )
+
+    def _run(self) -> None:
+        try:
+            if os.name == "nt":
+                self._run_windows()
+            else:
+                self._run_posix()
+        except Exception:
+            logging.exception("Headless terminal keyboard listener stopped unexpectedly.")
+
+    def _run_windows(self) -> None:
+        import msvcrt
+
+        while not self._stop_event.is_set():
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                continue
+
+            char = msvcrt.getwch()
+            if char in ("\x00", "\xe0"):
+                extended = msvcrt.getwch()
+                if extended == "M":
+                    self._dispatch_token("right")
+                elif extended == "K":
+                    self._dispatch_token("left")
+                continue
+            if char == "\x1b":
+                self._dispatch_token("esc")
+                continue
+            self._dispatch_token(char)
+
+    def _run_posix(self) -> None:
+        import select
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        previous_attrs = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop_event.is_set():
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+                token = self._read_posix_token(fd)
+                if token is not None:
+                    self._dispatch_token(token)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous_attrs)
+
+    def _read_posix_token(self, fd: int) -> str | None:
+        import select
+
+        char = os.read(fd, 1)
+        if not char:
+            return None
+        if char != b"\x1b":
+            return char.decode(errors="ignore")
+
+        suffix = b""
+        for _ in range(2):
+            ready, _, _ = select.select([fd], [], [], 0.01)
+            if not ready:
+                break
+            suffix += os.read(fd, 1)
+
+        if suffix in {b"[C", b"OC"}:
+            return "right"
+        if suffix in {b"[D", b"OD"}:
+            return "left"
+        return "esc"
 
 
 def predict_action(
@@ -145,6 +308,23 @@ def init_keyboard_listener(
     events["episode_outcome"] = None
 
     if is_headless():
+        if _can_use_headless_terminal_hotkeys():
+            logging.warning(
+                "Headless environment detected. On-screen cameras display will not be available. "
+                "Using terminal hotkey fallback on stdin. Keep this terminal focused for '%s', '%s', '%s', and ESC.",
+                intervention_toggle_key,
+                episode_success_key if episode_success_key is not None else "<disabled>",
+                episode_failure_key if episode_failure_key is not None else "<disabled>",
+            )
+            listener = _HeadlessTerminalKeyboardListener(
+                events,
+                intervention_toggle_key=intervention_toggle_key,
+                episode_success_key=episode_success_key,
+                episode_failure_key=episode_failure_key,
+            )
+            listener.start()
+            return listener, events
+
         logging.warning(
             "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
         )
@@ -156,38 +336,24 @@ def init_keyboard_listener(
 
     def on_press(key):
         try:
+            token = None
             if key == keyboard.Key.right:
-                print("Right arrow key pressed. Exiting loop...")
-                events["exit_early"] = True
+                token = "right"
             elif key == keyboard.Key.left:
-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
-                events["rerecord_episode"] = True
-                events["exit_early"] = True
+                token = "left"
             elif key == keyboard.Key.esc:
-                print("Escape key pressed. Stopping data recording...")
-                events["stop_recording"] = True
-                events["exit_early"] = True
-            elif hasattr(key, "char") and key.char and key.char.lower() == intervention_toggle_key.lower():
-                print(f"'{intervention_toggle_key}' key pressed. Toggling intervention mode...")
-                events["toggle_intervention"] = True
-            elif (
-                episode_success_key
-                and hasattr(key, "char")
-                and key.char
-                and key.char.lower() == episode_success_key.lower()
-            ):
-                print(f"'{episode_success_key}' key pressed. Marking episode as success and exiting loop...")
-                events["episode_outcome"] = EPISODE_SUCCESS
-                events["exit_early"] = True
-            elif (
-                episode_failure_key
-                and hasattr(key, "char")
-                and key.char
-                and key.char.lower() == episode_failure_key.lower()
-            ):
-                print(f"'{episode_failure_key}' key pressed. Marking episode as failure and exiting loop...")
-                events["episode_outcome"] = EPISODE_FAILURE
-                events["exit_early"] = True
+                token = "esc"
+            elif hasattr(key, "char") and key.char:
+                token = key.char
+
+            if token is not None:
+                _apply_keyboard_hotkey_token(
+                    events,
+                    token,
+                    intervention_toggle_key=intervention_toggle_key,
+                    episode_success_key=episode_success_key,
+                    episode_failure_key=episode_failure_key,
+                )
         except Exception as e:
             print(f"Error handling key press: {e}")
 
