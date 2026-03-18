@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -287,3 +288,18 @@ def test_iccq_raw_batch_hook_builds_td_and_preference_targets(hf_stubs, tmp_path
     assert torch.allclose(out[cfg.preference_weight_key], torch.tensor([0.0, 0.5, 0.0]))
     assert out[cfg.reward_pad_key][2, 1].item() is True
     assert out[cfg.next_observation_pad_key][2].item() is True
+
+
+def test_coerce_pref_array_handles_object_arrays_with_singleton_dims():
+    chunk_value = np.empty((1,), dtype=object)
+    chunk_value[0] = np.array([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]], dtype=np.float32)
+    pad_value = np.empty((1,), dtype=object)
+    pad_value[0] = np.array([False, True], dtype=np.bool_)
+
+    chunk = iccq_modeling._coerce_pref_array(chunk_value, dtype=np.float32, expected_shape=(2, 4))
+    pad = iccq_modeling._coerce_pref_array(pad_value, dtype=np.bool_, expected_shape=(2,))
+
+    assert chunk.shape == (2, 4)
+    assert pad.shape == (2,)
+    assert np.allclose(chunk[0], np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32))
+    assert pad.tolist() == [False, True]

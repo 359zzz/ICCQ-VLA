@@ -70,6 +70,29 @@ def _expectile_loss(diff: Tensor, tau: float) -> Tensor:
     return weight * diff.square()
 
 
+def _coerce_pref_array(value: Any, *, dtype: np.dtype, expected_shape: tuple[int, ...]) -> np.ndarray:
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist() if value.dtype == object else value
+
+    arr = np.asarray(value, dtype=dtype)
+    while arr.ndim > len(expected_shape) and arr.shape[0] == 1:
+        arr = arr[0]
+
+    if arr.shape != expected_shape:
+        if len(expected_shape) == 2:
+            rows = [np.asarray(row, dtype=dtype) for row in value]
+            arr = np.stack(rows, axis=0)
+        elif len(expected_shape) == 1:
+            arr = np.asarray(list(value), dtype=dtype)
+
+    if arr.shape != expected_shape:
+        raise ValueError(f"Expected preference array shape {expected_shape}, got {arr.shape}.")
+
+    return arr.astype(dtype, copy=False)
+
+
 class ICCQModel(nn.Module):
     def __init__(self, cfg: ICCQConfig):
         super().__init__()
@@ -479,8 +502,16 @@ class ICCQPolicy(PreTrainedPolicy):
 
                 if negative_chunk is not None and int(abs_index) in preference_lookup:
                     pref = preference_lookup[int(abs_index)]
-                    negative_chunk[row_idx] = np.asarray(pref["negative_action_chunk"], dtype=np.float32)
-                    negative_pad[row_idx] = np.asarray(pref["negative_action_pad"], dtype=np.bool_)
+                    negative_chunk[row_idx] = _coerce_pref_array(
+                        pref["negative_action_chunk"],
+                        dtype=np.float32,
+                        expected_shape=(self.config.chunk_horizon, action_feature.shape[0]),
+                    )
+                    negative_pad[row_idx] = _coerce_pref_array(
+                        pref["negative_action_pad"],
+                        dtype=np.bool_,
+                        expected_shape=(self.config.chunk_horizon,),
+                    )
                     preference_weight[row_idx] = float(pref["propagation_weight"])
 
             batch[self.config.reward_chunk_key] = torch.from_numpy(reward_chunks).to(dtype=torch.float32)
