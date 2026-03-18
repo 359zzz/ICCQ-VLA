@@ -103,3 +103,22 @@ def test_wrap_with_plugin(plugin_dir: Path):
     assert isinstance(cfg, Config)
     assert isinstance(cfg.env, EnvConfig.get_choice_class("test_env"))
     assert cfg.env.value == 42
+
+
+def test_wrap_resolves_string_annotations():
+    @dataclass
+    class Config:
+        value: int = 42
+
+    @wrap()
+    def dummy_func(cfg):
+        return cfg
+
+    dummy_func.__annotations__ = {"cfg": "Config"}
+    dummy_func.__globals__["Config"] = Config
+
+    sys.argv = ["dummy_script.py"]
+
+    cfg = dummy_func()
+    assert isinstance(cfg, Config)
+    assert cfg.value == 42
