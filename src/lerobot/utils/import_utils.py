@@ -45,22 +45,11 @@ def is_package_available(
             package_version = importlib.metadata.version(pkg_name)
 
         except importlib.metadata.PackageNotFoundError:
-            # Fallback method: Only for "torch" and versions containing "dev"
-            if pkg_name == "torch":
-                try:
-                    package = importlib.import_module(import_name)
-                    temp_version = getattr(package, "__version__", "N/A")
-                    # Check if the version contains "dev"
-                    if "dev" in temp_version:
-                        package_version = temp_version
-                        package_exists = True
-                    else:
-                        package_exists = False
-                except ImportError:
-                    # If the package can't be imported, it's not available
-                    package_exists = False
-            else:
-                # For packages other than "torch", don't attempt the fallback and set as not available
+            try:
+                package = importlib.import_module(import_name)
+                package_version = getattr(package, "__version__", "N/A")
+                package_exists = True
+            except ImportError:
                 package_exists = False
         logging.debug(f"Detected {pkg_name} version: {package_version}")
     if return_version:
