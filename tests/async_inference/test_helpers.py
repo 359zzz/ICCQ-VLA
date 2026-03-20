@@ -328,6 +328,33 @@ def test_prepare_raw_observation():
     assert isinstance(phone_img, torch.Tensor)
 
 
+def test_prepare_raw_observation_applies_rename_map_before_image_lookup():
+    """Runtime rename_map should be applied before policy image feature lookup."""
+    robot_obs = _create_mock_robot_observation()
+    lerobot_features = _create_mock_lerobot_features()
+    policy_image_features = {
+        f"{OBS_IMAGES}.camera_f": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+        f"{OBS_IMAGES}.camera_r": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 160, 160)),
+    }
+
+    prepared = prepare_raw_observation(
+        robot_obs,
+        lerobot_features,
+        policy_image_features,
+        rename_map={
+            f"{OBS_IMAGES}.laptop": f"{OBS_IMAGES}.camera_f",
+            f"{OBS_IMAGES}.phone": f"{OBS_IMAGES}.camera_r",
+        },
+    )
+
+    assert f"{OBS_IMAGES}.camera_f" in prepared
+    assert f"{OBS_IMAGES}.camera_r" in prepared
+    assert f"{OBS_IMAGES}.laptop" not in prepared
+    assert f"{OBS_IMAGES}.phone" not in prepared
+    assert prepared[f"{OBS_IMAGES}.camera_f"].shape == (3, 224, 224)
+    assert prepared[f"{OBS_IMAGES}.camera_r"].shape == (3, 160, 160)
+
+
 def test_raw_observation_to_observation_basic():
     """Test the main raw_observation_to_observation function."""
     robot_obs = _create_mock_robot_observation()

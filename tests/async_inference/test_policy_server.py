@@ -217,3 +217,43 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_predict_action_chunk_passes_rename_map(monkeypatch, policy_server):
+    """The async server should apply rename_map before image feature lookup."""
+    import lerobot.async_inference.policy_server as policy_server_module
+
+    captured = {}
+
+    def _fake_raw_observation_to_observation(
+        raw_observation,
+        lerobot_features,
+        policy_image_features,
+        rename_map=None,
+    ):
+        captured["raw_observation"] = raw_observation
+        captured["lerobot_features"] = lerobot_features
+        captured["policy_image_features"] = policy_image_features
+        captured["rename_map"] = rename_map
+        return {OBS_STATE: torch.zeros(1, 6)}
+
+    def _fake_get_action_chunk(_self, _obs, _type="act"):
+        return torch.zeros(1, policy_server.actions_per_chunk, 6)
+
+    monkeypatch.setattr(
+        policy_server_module,
+        "raw_observation_to_observation",
+        _fake_raw_observation_to_observation,
+        raising=True,
+    )
+    monkeypatch.setattr(policy_server_module.PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    policy_server.policy_type = "act"
+    policy_server.rename_map = {"observation.images.wrist": "observation.images.camera_r"}
+    policy_server.preprocessor = lambda obs: obs
+    policy_server.postprocessor = lambda tensor: tensor
+
+    obs = _make_obs(torch.zeros(6), timestep=5)
+    policy_server._predict_action_chunk(obs)
+
+    assert captured["rename_map"] == policy_server.rename_map
